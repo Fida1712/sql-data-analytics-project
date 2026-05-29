@@ -1,0 +1,420 @@
+-- =======================================
+--   ADVANCED DATA ANALYTICS
+-- =======================================
+
+-- =================================
+-- CUMULATIVE ANALYSIS
+-- =================================
+
+-- Analyze Sales Over Time by year
+select 
+date_format(order_date, '%Y-%m-01') as order_date,
+sum(sales_amount) as total_sales,
+count(distinct customer_key) as total_customers,
+sum(quantity) as total_quantity
+from gold_fact_sales
+where order_date is not null
+group by date_format(order_date, '%Y-%m-01')
+order by order_date
+;
+
+-- Cumulative Analysis -- aggregate data progressively over time
+-- Calculate the total sales per month
+-- Running total os sales over time
+select
+order_date,
+total_sales,
+sum(total_sales) over(order by order_date) as running_total_sales
+from(
+select 
+date_format(order_date, '%Y-01-01') as order_date,
+sum(sales_amount) as total_sales
+from gold_fact_sales
+where order_date is not null
+group by date_format(order_dATE, '%Y-01-01')
+order by order_date)t
+;
+
+
+-- moving average 
+select
+order_date,
+average_price,
+round(avg(average_price) over(order by order_date),2) as moving_avg_price
+from
+(
+select 
+date_format(order_date, '%Y-01-01') as order_date,
+round(avg(price),2) as average_price
+from gold_fact_sales
+where order_date is not null
+group by date_format(order_date, '%Y-01-01')
+order by order_date )t;
+
+-- =================================
+-- PERFORMANCE ANALYSIS
+-- =================================
+/* Analyze the yearly performance of products by comparing each poducts sales to both 
+its average sales performance and the previous year's sales */
+with yearly_product_sales as
+(
+select 
+year(f.order_date) as order_year,
+p.product_name,
+sum(f.sales_amount) as current_sales
+from gold_fact_sales f 
+left join gold_dim_products p 
+on f.product_key = p.product_key
+where f.order_date is not null
+group by year(f.order_date), p.product_name 
+order by order_year)
+
+select 
+order_year,
+product_name,
+current_sales,
+round(avg(current_sales) over(partition by product_name),2) as average_sales,
+current_sales - round(avg(current_sales) over(partition by product_name),2) as diff_avg,
+case
+	when 
+	current_sales - round(avg(current_sales) over(partition by product_name),2)  > 0
+    then 'Above avg'
+    when 
+	current_sales - round(avg(current_sales) over(partition by product_name),2) < 0
+    then 'Below avg'
+    else 'Avg'
+end as avg_change,
+-- YOY ANALYSIS
+lag(current_sales) over(partition by product_name order by order_year) as pv_sales,
+current_sales - lag(current_sales) over(partition by product_name order by order_year) as diff_py,
+case
+	when 
+	current_sales - lag(current_sales) over(partition by product_name order by order_year)  > 0
+    then 'Increase'
+    when 
+	current_sales -lag(current_sales) over(partition by product_name order by order_year)  < 0
+    then 'Decrease'
+    else 'No Change'
+end as py_change
+from yearly_product_sales
+order by product_name, order_year
+;
+
+
+
+-- =================================
+-- PART TO WHOLE ANALYSIS
+-- =================================
+/*Analyze how individual part is performing compared to overall
+allowing us to understand which category has the greatest imapct on the business
+*/
+
+-- Which categories contributes most to averalll sales?
+with category_sales as
+(
+select 
+p.category,
+sum(f.sales_amount) as total_sales
+from gold_fact_sales f 
+left join gold_dim_products p
+on f.product_key = p.product_key
+group by p.category)
+
+select
+category,
+total_sales,
+sum(total_sales) over() overall_sales,
+concat(round((total_sales / sum(total_sales) over()) * 100, 2), '%') as percentage_of_total
+from category_sales
+order by percentage_of_total desc;
+
+
+
+-- =================================
+-- DATA SEGMENTATION
+-- =================================
+/* Segment products into cost ranges and count how many
+products fall into each segment
+*/
+with product_segments as (
+select 
+product_key,
+product_name,
+cost,
+case
+	when cost < 100 then 'Below 100'
+    when cost between 100 and 500 then '100-500'
+    when cost between 500 and 1000 then '500-1000'
+    else 'Above 1000'
+end cost_range
+from gold_dim_products)
+
+select 
+cost_range,
+count(product_key) as total_products
+from product_segments
+group by cost_range
+order by total_products desc;
+
+
+
+/*
+Group customers into three segments based on their spending behaviour:
+-VIP: Customers with at least 12 months of history and spending more than $5,000.
+- Regular: Customers with at least 12 months of history and spending more than $4,500 or less. 
+- New: Customers with a life span less than 12 months.
+And Find the total number of customers by each group.
+*/
+with customer_history as
+(
+select 
+c.customer_key,
+coalesce(sum(f.sales_amount),0) as total_spending,
+min(f.order_date) as first_order,
+max(f.order_date) as last_order,
+timestampdiff(month, min(f.order_date), max(f.order_date)) as total_time,
+case
+	when MIN(f.order_date) is null then 'New'
+	when timestampdiff(month, min(f.order_date), max(f.order_date)) >= 12 and 
+    coalesce(sum(f.sales_amount),0) > 5000
+    then 'VIP'
+    when timestampdiff(month, min(f.order_date), max(f.order_date)) >= 12 and 
+    coalesce(sum(f.sales_amount),0) <= 5000 
+    then 'Regular'
+    else 'New'
+end as customer_segment
+from dim_customers_mat c
+left join fact_sales_mat f 
+on f.customer_key = c.customer_key
+group by c.customer_key
+)
+select 
+customer_segment,
+count(customer_key) as total_customers
+from customer_history
+group by customer_segment
+order by total_customers desc
+;
+
+/*
+===================================================
+CUSTOMER REPORT
+===================================================
+Purpose:
+	- This report consolidates key customer metrics and behaviors
+    
+Highlights:
+	1. Gather essential fields such as names, ages, and transaction details.
+    2. Segmnets cusotmer into categories (VIP, Regular, New) and age groups.
+    3. Aggregate Customers - level metrics:
+		- total orders
+        - total sales
+        - total quantity purchased
+        - total products
+        - lifespan (in months) 
+	4. Calculates valuable KPIs:
+		- recency (months since last order)
+        - average order value
+        - average monthly spend
+============================================================
+*/
+drop view if exists gold_report_customers;
+create view  gold_report_customers as
+with base_query as
+(
+-- getting all columns required 
+select 
+c.customer_key,
+c.customer_number,
+c.first_name,
+c.last_name,
+f.order_number,
+concat(c.first_name, ' ', c.last_name) as customer_name,
+f.sales_amount,
+f.order_date,
+f.quantity,
+f.product_key,
+timestampdiff(year, c.birthdate, curdate())  as age
+from fact_sales_mat f 
+left join dim_customers_mat c
+on f.customer_key = c.customer_key
+where f.order_date is not null
+)
+
+-- aggreagte customer level metrics
+, customer_agg as
+(
+select
+customer_key,
+customer_number,
+customer_name,
+age,
+count(distinct order_number) as total_orders,
+sum(sales_amount) as total_sales,
+sum(quantity) as total_quantity,
+count(distinct product_key) as total_products,
+max(order_date) as last_order,
+timestampdiff(month, min(order_date), max(order_date)) as lifespan
+from base_query
+group by 
+	customer_key,
+    customer_name,
+    customer_number,
+    age
+)
+-- final grouping 
+select
+	customer_key,
+	customer_number,
+	customer_name,
+    age,
+    case
+	when age < 20 then 'Under 20'
+    when age between 20 and 29 then '20-29'
+    when age between 30 and 39 then '30-39'
+    when age between 40 and 49 then '40-49'
+    else ' 50 and Above '
+	end as age_group,
+	case
+		when lifespan >= 12 and total_sales > 5000
+		then 'VIP'
+		when lifespan >= 12 and total_sales <= 5000 
+		then 'Regular'
+    else 'New'
+	end as customer_segment,
+    last_order,
+	timestampdiff(month, last_order, curdate()) as recency,
+    total_orders,
+    total_sales,
+    total_quantity,
+    total_products,
+    lifespan,
+    
+	-- Compute average order value(AVO)
+    case 
+		when total_sales = 0 then 0
+		else round(total_sales / total_orders,2) 
+	end as avg_order_value,
+    
+    -- Average Monthly Spending = Total Sales / Nr. of Months
+	case 
+		when lifespan = 0 then total_sales
+		else round(total_sales / lifespan, 2)
+	end as avg_monthly_spending
+from customer_agg;
+
+-- Checking data from Customer Report
+select 
+customer_segment,
+count(customer_number) as total_customers,
+sum(total_sales) as total_sales
+from gold_report_customers
+group by customer_segment;
+
+
+ 
+/*
+===================================================
+PRODUCT REPORT
+===================================================
+Purpose:
+	- This report consolidates key product metrics and behaviors
+    
+Highlights:
+	1. Gather essential fields such as product name, category, subcategory, and cost.
+    2. Segmnets products by revenue to identify High Performers, Mid range, or low- range.
+    3. Aggregate products - level metrics:
+		- total orders
+        - total sales
+        - total quantity sold
+        - total customers (unique)
+        - lifespan (in months) 
+	4. Calculates valuable KPIs:
+		- recency (months since last order)
+        - average order value
+        - average monthly spend
+============================================================
+*/
+
+create view gold_report_products as
+-- create base query
+with base_query as
+(
+select
+	p.product_key,
+	f.customer_key,
+	f.order_number,
+	p.product_name,
+	p.category,
+	p.subcategory,
+	p.cost,
+	f.quantity,
+	f.sales_amount,
+	f.order_date
+
+from fact_sales_mat f 
+left join dim_products_mat p 
+	on f.product_key = p.product_key
+where order_date is not null
+)
+
+-- create aggregations
+, products_agg as
+(
+select
+product_key,
+product_name,
+category,
+subcategory,
+cost ,
+count(distinct order_number) as total_orders,
+sum(sales_amount) as revenue,
+sum(quantity) as total_quantity,
+count( distinct customer_key) as total_customers,
+timestampdiff(month, max(order_date), min(order_date)) as prod_lifespan,
+max(order_date) as last_order,
+round(avg(sales_amount / nullif(quantity,0)), 1) as avg_selling_price
+from base_query
+
+group by 
+product_key,
+product_name, 
+category,
+subcategory,
+cost
+)
+
+select 
+product_key,
+product_name,
+category,
+subcategory,
+cost,
+last_order as last_selling_date,
+timestampdiff(month, last_order, curdate()) as recency_in_months,
+CASE
+    WHEN revenue >= 5000000 THEN 'High Performer'
+    WHEN revenue >= 1000000 THEN 'Medium Performer'
+    ELSE 'Low Performer'
+END as product_segment,
+prod_lifespan,
+revenue,
+total_quantity,
+total_customers,
+avg_selling_price,
+case
+	when  revenue = 0 then 0
+    else round(revenue / total_orders ,2)  
+end as avg_order_rev,
+case
+	when  prod_lifespan <= 0 then revenue
+    else round(revenue / prod_lifespan , 2) 
+end as avg_monthly_rev
+
+from products_agg;
+
+
+
+
+
+
